@@ -5,7 +5,9 @@ date: "2023-07-22"
 output: html_document
 ---
 
-With recent global events such as the Covid-19 Pandemic, Claim Inflation - the fluctuation of the frequency and size of claim payments around goods and services have inevitably become a pressing issue for insurance companies. The effects of the recent pandemic have resulted in large disruptions to the global supply chain especially for motor insurance, which has seen increases in claim inflation due to shortages in both the supply chain and in the workforce. At the crux of the matter is an issue for future prediction of claim inflations based on covid impacted data due to volatility of these covid trends. As such, we will further the approaches used to predict future trends based off historical data by integrating external factors that may be indicative of claim inflation.
+With recent global events such as the Covid-19 Pandemic, Claim Inflation - the fluctuation of the frequency and size of claim payments around goods and services have inevitably become a pressing issue for insurance companies. The effects of the recent pandemic have resulted in large disruptions to the global supply chain especially for motor insurance, which has seen increases in claim inflation due to shortages in both the supply chain and in the workforce.
+
+Given the instability of post-Covid claims experience, our goal is to augment standard actuarial GLM models with external macroeconomic indicators to better capture inflation drivers and reduce prediction uncertainty.
 
 The work covers:
 
@@ -19,7 +21,7 @@ The work covers:
 
 -   Severity modelling (Gamma -- log link)
 
--   Model selection via `regsubsets()` and `stepAIC()`
+-   Model selection via `stepAIC()`
 
 -   Cross--validation
 
@@ -32,30 +34,62 @@ library(zoo)
 library(MASS)
 library(caret)
 library(leaps)
+library(reshape2)
 ```
 
 ## Reading and Cleaning Claim data
 
 ```{r}
-claims <- read.csv("claims.csv", fileEncoding = "UTF-8-BOM") %>%
-  mutate(
-    accident_month = as.Date(accident_month),
-    vehicle_class = as.factor(vehicle_class),
-    risk_state_name = as.factor(risk_state_name),
-    total_claims_cost = ifelse(is.na(total_claims_cost), 0, total_claims_cost)
-  )
-# Converting categorical variables for modelling
-# we are working under the assumption that NA under total claim costs indicates a zero claim cost as 1218397 of 1226044 observations have NA for total claim costs
+raw <- read.csv("claims.csv", fileEncoding = "UTF-8-BOM")
 
 # examining structure
-str(claims)
+str(raw)
 ```
 
-Claims represents historical motor insurance claims including policy information, claim costs, vehicle and claimant information.
+Claims represents historical motor insurance claims including policy information, claim costs, vehicle and claimant information. It has 1226044 rows and 13 variables. Each row represents the policy for a month.
+
+| Variable              | Type                    | Description                                        |
+|-------------------|-------------------|----------------------------------|
+| `accident_month`      | Date                    | Month of claim occurrence or exposure period.      |
+| `term_start_date`     | Datetime (string)       | Policy inception date/time.                        |
+| `term_expiry_date`    | Datetime (string)       | Policy expiry date/time.                           |
+| `policy_id`           | Integer                 | Unique policy identifier.                          |
+| `policy_tenure`       | Integer                 | Years the policy has been active.                  |
+| `sum_insured`         | Integer                 | Agreed vehicle value in AUD.                       |
+| `risk_state_name`     | Categorical (8 levels)  | State/territory of risk location.                  |
+| `risk_postcode`       | Integer                 | Postcode of insured risk.                          |
+| `year_of_manufacture` | Integer                 | Year vehicle was built.                            |
+| `vehicle_class`       | Categorical (15 levels) | Classification of vehicle type.                    |
+| `claim_loss_date`     | String                  | Date of loss if claim occurred. Empty if no claim. |
+| `exposure`            | Numeric                 | Policy exposure fraction for the year.             |
+| `total_claims_cost`   | Numeric                 | Total cost of all claims in that month.            |
 
 ```{r}
-summary(claims)
+claims <- raw %>%
+  mutate(
+    # Date Features
+    accident_month = floor_date(as.Date(accident_month), "month"), 
+    # floored to align with external data
+    term_start_date = ymd_hms(term_start_date),
+    term_expiry_date = ymd_hms(term_expiry_date),
+    claim_loss_date = ymd_hms(claim_loss_date),
+    
+    # Engineered featuyres
+    vehicle_age = year(accident_month) - year_of_manufacture,
+    accident_year = year(accident_month),
+    accident_month_num = month(accident_month),
+    
+    # Frequency Target
+    claim_count = ifelse(!is.na(total_claims_cost) & total_claims_cost > 0, 1 , 0),
+    
+    # Categorical fields
+    vehicle_class = as.factor(vehicle_class),
+    risk_state_name = as.factor(risk_state_name),
+    
+  )
 ```
+
+Some basic feature engineering, and converting fields to their proper types.
 
 ### External Data
 
@@ -74,168 +108,218 @@ quarterly <- read.csv("quarterly.csv", fileEncoding = "UTF-8-BOM") %>%
     Quarter = as.yearqtr(accident_month)
   ) %>%
   dplyr::select(Quarter, transport_cpi, motor_cpi, parts_cpi, repair_cpi, wage_index)
-```
 
-```{r}
-claims_clean <- claims %>%
-  mutate(
-    accident_month = floor_date(accident_month, "month"),
-    age = year(accident_month) - year_of_manufacture
-  )
-# accident_month: floor to first day of month to align data
-# age: vehicle age at time of accident in years
-
-claims_clean <- claims_clean %>%
-  left_join(monthly, by = "accident_month") %>%
+external_data <- monthly %>%
   mutate(Quarter = as.yearqtr(accident_month)) %>%
   left_join(quarterly, by = "Quarter")
+external_data$Quarter <- as.factor(external_data$Quarter)
+
+str(external_data)
+summary(external_data)
+```
+
+| Variable         | Type                     | Description                                                                           |
+|------------------|------------------|-------------------------------------|
+| `accident_month` | Date                     | First day of the month for macroeconomic observation. Used to align with claim month. |
+| `petrol`         | Numeric                  | Average petrol price for the month (AUD).                                             |
+| `unemployment`   | Numeric                  | Monthly unemployment rate (%)                                                         |
+| `gold`           | Numeric                  | Average gold price for the month (AUD/oz).                                            |
+| `Quarter`        | Year-Quarter (`yearqtr`) | Quarter of the year (e.g., 2016 Q3).                                                  |
+| `transport_cpi`  | Numeric                  | Transport component of the Consumer Price Index (CPI).                                |
+| `motor_cpi`      | Numeric                  | Motor vehicle CPI component for the month.                                            |
+| `parts_cpi`      | Numeric                  | CPI index for vehicle parts and components.                                           |
+| `repair_cpi`     | Numeric                  | CPI index for vehicle repair costs.                                                   |
+| `wage_index`     | Numeric                  | Wage index representing average wage levels, for inflation adjustment.                |
+
+```{r}
+claims_combined <- claims %>%
+  left_join(external_data, by = "accident_month")
 ```
 
 ## EDA
 
 ```{r}
-nonzero_amnt <- length(claims$total_claims_cost[claims$total_claims_cost > 0])
-nonzero_amnt
-length(claims$total_claims_cost)
-nonzero_amnt / length(claims$total_claims_cost)
+summary(claims_combined)
+sapply(claims_combined, function(x) sum(is.na(x)))
+
+table(claims_combined$claim_count)
 ```
 
-6651 of 1226044 data points have a nonzero claim cost, which corresponds to approximately 0.5%.
+6651 of 1226044 data points have a nonzero claim cost, which corresponds to approximately 0.5% of policies. The only missing/NA values are from `total_claims_cost` and `claim_loss_date`. However, these constitute a majority of policy periods which with no claim. As such, they were just converted to a non-claim data point.
 
-### Claim Severity
+### Distribution Plots
 
 ```{r}
 # Checking distributions
-claims %>%
-  ggplot(aes(x = total_claims_cost)) +
-  geom_histogram(bins=50, fill='steelblue', alpha=0.7) + 
-  ggtitle("Total Claims Cost Histogram")
+# Claim count (frequency)
+ggplot(claims_combined, aes(x = claim_count)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Claim Count Distribution", x = "Claim Count", y = "Number of Records")
 
+# Total claims cost (severity)
+ggplot(claims_combined %>% filter(claim_count > 0), aes(x = total_claims_cost)) +
+  geom_histogram(fill = "salmon", bins = 50) +
+  scale_x_log10() +  # log scale for skewed cost
+  labs(title = "Distribution of Claim Costs (log scale)", x = "Total Claim Cost", y = "Frequency")
 
-claims %>%
-  mutate(accident_month = floor_date(accident_month, "month")) %>%
-  group_by(accident_month) %>%
-  summarise(total_claim_amount = sum(total_claims_cost), .groups = "drop") %>%
-  ggplot(aes(x = accident_month, y = total_claim_amount)) +
-  geom_line(color = "steelblue") +
-  geom_point(alpha = 0.6) +
-  labs(title = "Total Monthly Claim Size Over Time",
-       x = "Accident Month",
-       y = "Number of Claims") +
-  theme_minimal()
+# Exposure distribution
+ggplot(claims_combined, aes(x = exposure)) +
+  geom_histogram(fill = "lightgreen", bins = 50) +
+  labs(title = "Distribution of Exposure", x = "Exposure (year fraction)", y = "Frequency")
 
-monthly_claims <- claims %>%
-  mutate(accident_month = floor_date(accident_month, "month")) %>%
-  group_by(accident_month) %>%
-  summarise(total_claim_amount = sum(total_claims_cost), .groups = "drop")
+# Vehicle age distribution
+ggplot(claims_combined, aes(x = vehicle_age)) +
+  geom_histogram(fill = "orchid", bins = 20) +
+  labs(title = "Vehicle Age Distribution", x = "Vehicle Age (years)", y = "Frequency")
 
-ts_claims <- ts(monthly_claims$total_claim_amount, frequency = 12, start = c(year(min(monthly_claims$accident_month)), month(min(monthly_claims$accident_month))))
-decomp <- stl(ts_claims, s.window = "periodic")
-plot(decomp)
+# Sum insured distribution (log scale)
+ggplot(claims_combined, aes(x = sum_insured)) +
+  geom_histogram(fill = "orange", bins = 50) +
+  scale_x_log10() +
+  labs(title = "Distribution of Sum Insured (log scale)", x = "Sum Insured (AUD)", y = "Frequency")
 ```
 
 Only a small proportion of claims result in non-zero costs. Specifically 0.5% only. Nonzero claims would therefore heavily skew claim cost amount. Therefore, for severity analysis, only non-zero claims are to be included whereas frequency analysis will contain the full amount.
 
-### Claim Frequency
+### Categorical Variables
 
 ```{r}
-claims %>%
-  mutate(accident_month = floor_date(accident_month, "month")) %>%
-  group_by(accident_month) %>%
-  summarise(claim_count = n(), .groups = "drop") %>%
-  ggplot(aes(x = accident_month, y = claim_count)) +
-  geom_line(color = "steelblue") +
-  geom_point(alpha = 0.6) +
-  labs(title = "Monthly Claim Count Over Time",
-       x = "Accident Month",
-       y = "Number of Claims") +
-  theme_minimal()
+# Vehicle class
+ggplot(claims_combined, aes(x = vehicle_class)) +
+  geom_bar(fill = "skyblue") +
+  labs(title = "Vehicle Class Distribution", x = "Vehicle Class", y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-monthly_claims <- claims %>%
-  mutate(accident_month = floor_date(accident_month, "month")) %>%
-  group_by(accident_month) %>%
-  summarise(claim_count = n(), .groups = "drop")
-
-ts_claims <- ts(monthly_claims$claim_count, frequency = 12, start = c(year(min(monthly_claims$accident_month)), month(min(monthly_claims$accident_month))))
-decomp <- stl(ts_claims, s.window = "periodic")
-plot(decomp)
-
-claims %>%
-  mutate(accident_month = floor_date(accident_month, "month")) %>%
-  group_by(accident_month) %>%
-  summarise(claim_count = n(), .groups = "drop") %>%
-  ggplot(aes(x = claim_count)) +
-  geom_histogram(bins = 20, fill = "steelblue", alpha = 0.7) +
-  labs(title = "Distribution of Monthly Claim Counts",
-       x = "Monthly Claim Count",
-       y = "Frequency") +
-  theme_minimal()
-
+# Risk state
+ggplot(claims_combined, aes(x = risk_state_name)) +
+  geom_bar(fill = "lightcoral") +
+  labs(title = "Risk State Distribution", x = "State", y = "Count")
 ```
 
-There is a clear seasonal trend impacting claim size and frequency. As such, introducing month as a standalone variable is critical in reflecting those seasonal trends.
+ACT, Tasmania, and Northern Territory all have significantly lower claim counts compared to other states. Especially for nonzero claims. This may result in the model in failing to encapsulate regional affects on claim severity.
 
-Also there is a noticeable dip in 2020-21 due to the affects of the Covid-19 pandemic. However, this work aims to general transferable variables that can explain fluctuations in claims inflation, rather than purely COVID-specific indicators. As such, they were excluded from this analysis with a goal in building a model that would be more robust to future shocks.
+### Time Trends
+
+```{r}
+# Monthly claims frequency trend
+monthly_freq <- claims_combined %>%
+  group_by(accident_month) %>%
+  summarise(total_claims = sum(claim_count),
+            avg_claim_cost = mean(total_claims_cost, na.rm = TRUE),
+            avg_exposure = mean(exposure))
+
+ggplot(monthly_freq, aes(x = accident_month, y = total_claims)) +
+  geom_line(color = "blue") +
+  labs(title = "Monthly Claim Frequency Over Time", x = "Accident Month", y = "Total Claims")
+
+ggplot(monthly_freq, aes(x = accident_month, y = avg_claim_cost)) +
+  geom_line(color = "red") +
+  labs(title = "Average Claim Cost Over Time", x = "Accident Month", y = "Average Claim Cost")
+```
+
+There doesn't appear to be any blatantly obvious seasonal effects on both claim frequency and size.
+
+### Macroeconomic Variables
+
+```{r}
+macro_vars <- c("petrol", "unemployment", "gold", "transport_cpi",
+                "motor_cpi", "parts_cpi", "repair_cpi", "wage_index")
+
+# Correlation heatmap
+corr_df <- claims_combined %>%
+  dplyr::select(claim_count, total_claims_cost, all_of(macro_vars)) %>%
+  mutate(total_claims_cost = ifelse(is.na(total_claims_cost), 0, total_claims_cost))
+
+cor_matrix <- cor(corr_df)
+corr_melt <- melt(cor_matrix)
+
+ggplot(corr_melt, aes(x=Var1, y=Var2, fill=value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white",
+                       midpoint = 0, limit = c(-1,1)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Correlation Heatmap")
+
+# Scatterplots: claim frequency vs petrol, motor_cpi
+ggplot(claims_combined, aes(x = petrol, y = claim_count)) +
+  geom_jitter(alpha = 0.3) +
+  labs(title = "Claim Count vs Petrol Price", x = "Petrol Price", y = "Claim Count")
+
+ggplot(claims_combined, aes(x = motor_cpi, y = claim_count)) +
+  geom_jitter(alpha = 0.3, color = "darkgreen") +
+  labs(title = "Claim Count vs Motor CPI", x = "Motor CPI", y = "Claim Count")
+```
+
+### Vehicle Age
+
+```{r}
+# Claim count vs vehicle age
+ggplot(claims_combined, aes(x = vehicle_age, y = claim_count)) +
+  geom_jitter(width = 0.2, alpha = 0.2) +
+  labs(title = "Claim Count vs Vehicle Age", x = "Vehicle Age", y = "Claim Count")
+
+# Claim cost vs vehicle age (for rows with claims)
+ggplot(claims_combined %>% filter(claim_count > 0), aes(x = vehicle_age, y = total_claims_cost)) +
+  geom_jitter(width = 0.2, alpha = 0.2, color = "darkred") +
+  scale_y_log10() +
+  labs(title = "Claim Cost vs Vehicle Age", x = "Vehicle Age", y = "Claim Cost (log scale)")
+```
+
+The jitter plot for claim count vs vehicle age actually indicates a correlation to newer vehicles with claim count. Intuitively, this can most likely be attributed to the deprecating nature of motor vehicles, although the direct cause can not be ascertained.
 
 ## Data Cleaning
 
-### Seasonal Trends
+### Outlier Detection
 
 ```{r}
-claims_clean <- claims_clean %>%
-  mutate(
-    month_sin = sin(2 * pi * month(accident_month) / 12),
-    month_cos = cos(2 * pi * month(accident_month) / 12)
+claims_with_cost <- claims_combined %>% filter(claim_count > 0)
+
+# IQR method for outlier detection
+iqr_cost <- IQR(claims_with_cost$total_claims_cost, na.rm = TRUE)
+q1_cost <- quantile(claims_with_cost$total_claims_cost, 0.25, na.rm = TRUE)
+q3_cost <- quantile(claims_with_cost$total_claims_cost, 0.75, na.rm = TRUE)
+
+upper_cost <- q3_cost + 1.5 * iqr_cost
+
+# Count and proportion of outliers
+outlier_summary <- claims_with_cost %>%
+  filter(total_claims_cost > upper_cost) %>%
+  summarise(
+    outlier_count = n(),
+    total_count = nrow(claims_with_cost),
+    proportion = n() / nrow(claims_with_cost)
+  )
+
+print(outlier_summary)
+
+# Histogram with vertical line at upper threshold
+ggplot(claims_with_cost, aes(x = total_claims_cost)) +
+  geom_histogram(bins = 50, fill = "salmon", color = "black") +
+  scale_x_log10() +
+  geom_vline(xintercept = upper_cost, color = "blue", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Total Claims Cost Distribution with Outlier Threshold",
+    x = "Total Claims Cost (log scale)",
+    y = "Frequency"
   )
 
 ```
 
-Cyclic encoding was chosen to represent the months over factors to capture the cyclic nature of the months (in regards to how December is adjacent to January). The goal is for this representation to better encapsulate seasonal periodicity.
-
-### Claim Severity
-
-```{r}
-claims_clean %>%
-  filter(total_claims_cost > 0) %>%
-  ggplot(aes(x = total_claims_cost)) +
-  geom_histogram(bins=50, fill='steelblue', alpha=0.7) +
-  ggtitle("Nonzero Total Claims Cost Histogram")
-```
-
-```{r}
-nonzero_claims <- claims_clean %>% filter(total_claims_cost > 0)
-
-# Computing IQRs
-claims_cost_iqr <- IQR(nonzero_claims$total_claims_cost, na.rm = TRUE)
-
-cc_upper <- quantile(nonzero_claims$total_claims_cost, 0.75, na.rm = TRUE) + 1.5 * claims_cost_iqr
-
-
-claims %>%
-  filter(total_claims_cost > 0) %>%
-  ggplot(aes(x = total_claims_cost)) +
-  geom_histogram(bins=50, fill='steelblue', alpha=0.7) +
-  geom_vline(xintercept = cc_upper, color='red', linetype='dashed') +
-  ggtitle("Nonzero Total Claims Cost with Outlier Threshold")
-
-n_removed <- sum(nonzero_claims$total_claims_cost > cc_upper)
-paste0(n_removed, " claims removed (", round(100*n_removed/nrow(nonzero_claims),1), "%)")
-```
-
 Outliers in nonzero claim amounts account for approximately 8% of all nonzero claim amounts. This is a non-negligible amount, and examining the histogram, removing the outliers would most likely result in poor performance in estimating large claims near the tail of the distribution. As such, the outliers were chosen to be kept in the dataset.
 
+### Data Aggregation
+
+Due to the low proportion of claims to total data points (0.5%). It was deciding that aggregating was more meaningful in estimating claim frequency and severity. As such, aggregating by month and risk segment was decided to be optimal.
+
 ```{r}
-claims_by_month <- claims_clean %>%
-  group_by(accident_month, month_sin, month_cos) %>%
+claims_agg <- claims_combined %>%
+  group_by(accident_month, risk_state_name, vehicle_class) %>%
   summarise(
-    claim_count = sum(!is.na(total_claims_cost)),
-    total_claims_cost = sum(total_claims_cost, na.rm = TRUE),
-    ave_tenure = mean(policy_tenure, na.rm = TRUE),
-    ave_year_manu = mean(year_of_manufacture, na.rm = TRUE),
-    ave_sum_insured = mean(sum_insured, na.rm = TRUE),
-    ave_age = mean(age, na.rm = TRUE),
-    ave_exposure = mean(exposure, na.rm = TRUE),
-    # Aggregate macro variables by taking monthly averages (already aligned to accident_month)
+    total_claims = sum(claim_count, na.rm = TRUE),          # frequency
+    total_cost   = sum(total_claims_cost, na.rm = TRUE),   # severity numerator
+    total_exposure = sum(exposure, na.rm = TRUE),          # offset
+    avg_vehicle_age = mean(vehicle_age, na.rm = TRUE),     # predictor
+    avg_sum_insured = mean(sum_insured, na.rm = TRUE),     # predictor
     petrol = mean(petrol, na.rm = TRUE),
     unemployment = mean(unemployment, na.rm = TRUE),
     gold = mean(gold, na.rm = TRUE),
@@ -245,318 +329,199 @@ claims_by_month <- claims_clean %>%
     repair_cpi = mean(repair_cpi, na.rm = TRUE),
     wage_index = mean(wage_index, na.rm = TRUE),
     .groups = "drop"
-  ) %>%
-  mutate(
-    average_cost = total_claims_cost / claim_count,
-    Quarter = as.yearqtr(accident_month)
   )
-```
-
-```{r}
-model_vars <- total_claims_cost ~ motor_cpi + parts_cpi + transport_cpi + risk_state_name +
-  policy_tenure + repair_cpi + wage_index + petrol + unemployment +
-  vehicle_class + age + sum_insured + year_of_manufacture
-
-# Using regsubsets() to explore combinations of predictors and choose those with highest adjusted R² and lowest Cp
-subset_fit <- regsubsets(model_vars, data = claims_clean, nvmax = 13)
-subset_summary <- summary(subset_fit)
-```
-
-```{r}
-nv <- 1:length(subset_summary$adjr2)
-adjr2 <- subset_summary$adjr2
-cp <- subset_summary$cp
-
-subset_plot <- tibble(
-  ModelSize = nv,
-  Adjusted_R2 = adjr2,
-  Cp = cp
-)
-
-ggplot(subset_plot, aes(x = ModelSize)) +
-  geom_line(aes(y = Adjusted_R2, color = "Adj R²")) +
-  geom_point(aes(y = Adjusted_R2, color = "Adj R²")) +
-  geom_line(aes(y = -Cp/100, color = "Cp (scaled)")) +
-  geom_point(aes(y = -Cp/100, color = "Cp (scaled)")) +
-  scale_y_continuous(
-    name = "Adjusted R²",
-    sec.axis = sec_axis(~ -.*100, name = "Cp")
-  ) +
-  labs(x = "Number of Variables", color = "") +
-  theme_minimal()
 ```
 
 ## Modelling
 
-### Claim Severity
+The objective of the modelling exercise is to explain the main drivers of insurance claim costs and to estimate the underlying trend in claim inflation. Because claim costs can be separated into a *frequency* component and a *severity* component, the analysis uses a traditional two-part Generalised Linear Model (GLM) structure:
+
+1.  A **frequency model** for the number of claims per policy period
+
+2.  A **severity model** for the average cost of claims.
+
+GLMs are widely used in non-life insurance because:
+
+-   They can handle skewed, non-normal data (common in claims).
+
+-   They allow for exposure weighting.
+
+-   They provide interpretable coefficients that show the effect of each rating factor.
+
+-   They are consistent with industry practice and regulatory expectations.
+
+Given the goal of quantifying inflation and identifying cost drivers, interpretability is more important than using complex black-box models. A GLM therefore provides the right balance of rigour and transparency.
+
+### Model Pipeline
+
+The following function runs a full GLM workflow in one step to increase reproducibility and reduce code redundancy.
+
+1.  **Fitting the Model -** if an offset column is provided, it takes the log of that column and includes it as an offset in the GLM. Otherwise, it fits a standard GLM with the formula and family supplied.
+
+2.  **Generate Predictions** - once fitted, the model is used to predict fitted values on the same dataset.
+
+3.  **Compute Residuals** - the function automatically determines whether the target variable is `total_claims` or `total_cost` and calculates corresponding residuals.
+
+4.  **Calculate Performance Metrics**
+
+    1.  RMSE
+
+    2.  MAE
+
+    3.  Deviance ratio = residual deviance / degrees of freedom, a measure of goodness-of-fit. Values below 1 indicate no overdispersion relative to the assumed GLM family.
+
+5.  **Plot Predicted vs Actual -** produces a log--log scatterplot with a 45-degree reference line to visually assess fit and calibration.
+
+6.  **Return Everything**
 
 ```{r}
-glm_full <- glm(
-  model_vars,
-  data = nonzero_claims,
-  family = Gamma(link = "log")
-)
-
-glm_step <- stepAIC(glm_full, direction = "both", trace = FALSE)
-summary(glm_step)
+run_agg_glm_pipeline <- function(
+  data,
+  formula,
+  family,
+  offset_col = NULL,
+  plot_title = NULL
+) {
+  # Check for offset
+  if(!is.null(offset_col)) {
+    data$offset_tmp <- log(data[[offset_col]])
+    model <- glm(formula = formula, family = family, data = data, offset = offset_tmp)
+  } else {
+    model <- glm(formula = formula, family = family, data = data)
+  }
+  
+  # Predictions
+  if(!is.null(offset_col)) {
+    data$pred <- predict(model, newdata = data, type = "response")
+  } else {
+    data$pred <- predict(model, newdata = data, type = "response")
+  }
+  
+  # Residuals
+  target_var <- if("total_cost" %in% all.vars(formula)) "total_cost" else "total_claims"
+  data$residual <- data[[target_var]] - data$pred
+  
+  # Metrics
+  rmse <- sqrt(mean(data$residual^2, na.rm = TRUE))
+  mae  <- mean(abs(data$residual), na.rm = TRUE)
+  deviance_ratio <- model$deviance / model$df.residual
+  
+  cat("RMSE:", rmse, "\n")
+  cat("MAE:", mae, "\n")
+  cat("Deviance / DF:", deviance_ratio, "\n")
+  
+  # Plot predicted vs actual
+  p <- ggplot(data, aes(x = pred, y = .data[[target_var]])) +
+    geom_point(alpha = 0.5) +
+    geom_abline(intercept = 0, slope = 1, color = "red") +
+    scale_x_log10() +
+    scale_y_log10() +
+    labs(
+      title = ifelse(is.null(plot_title), "Predicted vs Actual", plot_title),
+      x = "Predicted",
+      y = "Actual"
+    )
+  
+  print(p)
+  
+  list(
+    model = model,
+    data = data,
+    metrics = list(rmse = rmse, mae = mae, deviance_ratio = deviance_ratio),
+    plot = p
+  )
+}
 ```
 
+### Frequency model
+
+Claim frequency is modelled using a GLM with a log link and a Poisson or Negative Binomial distribution. The Poisson distribution is the standard starting point for count data, but we check for over-dispersion. If over-dispersion is present, the Negative Binomial form provides a better fit.
+
+The model predicts the expected number of claims per policy, adjusted for exposure.
+
+The output of this model gives multiplicative relativities that show how each factor affects the likelihood of a claim.
+
 ```{r}
-set.seed(1)
-# shuffle first
-nonzero_claims <- nonzero_claims[sample(nrow(nonzero_claims)), ]
+freq_formula <- total_claims ~ avg_vehicle_age + vehicle_class + risk_state_name +
+                avg_sum_insured + petrol + unemployment + gold +
+                transport_cpi + motor_cpi + parts_cpi + repair_cpi + wage_index
 
-# Ensure at least one row per level of risk_state_name
-levels_needed <- levels(nonzero_claims$risk_state_name)
-nonzero_claims <- nonzero_claims %>%
-  group_by(risk_state_name) %>%
-  slice(1) %>%
-  ungroup() %>%
-  bind_rows(nonzero_claims)
-
-train_idx <- sample(seq_len(nrow(nonzero_claims)), size = 0.7 * nrow(nonzero_claims))
-train <- nonzero_claims[train_idx, ]
-test  <- nonzero_claims[-train_idx, ]
-
-train$risk_state_name <- factor(train$risk_state_name, levels = levels(nonzero_claims$risk_state_name))
-test$risk_state_name  <- factor(test$risk_state_name, levels = levels(nonzero_claims$risk_state_name))
-
-# fit model
-glm_train <- glm(
-  formula(glm_step),
-  data = train,
-  family = Gamma(link = "log")
+freq_results <- run_agg_glm_pipeline(
+  data = claims_agg,
+  formula = freq_formula,
+  family = poisson(),
+  offset_col = "total_exposure",
+  plot_title = "Frequency: Predicted vs Actual"
 )
 
-# Predictions
-pred <- predict(glm_train, test, type = "response")
+freq_model <- freq_results$model
 
 # Metrics
-rmse <- sqrt(mean((test$total_claims_cost - pred)^2))
-mae  <- mean(abs(test$total_claims_cost - pred))
-dispersion <- sum(resid(glm_train, type = "pearson")^2) / glm_train$df.residual
-
-rmse
-mae
-dispersion
+freq_results$metrics
+summary(freq_model)
 ```
 
-```{r}
-# Diagnostic Plots
-plot(glm_train)
+Examining the fit. RMSE of 1.23 claims per month and MAE is alright, with most variation being captured. Examining the graph, indicates that the model is performing better for larger counts with a larger spread of predicted values for smaller actual values. Values for deviance / DF are below 1 indicating no over-dispersion, this means that the Poisson assumption seems reasonable for modelling frequency. Negative Binomial was an alternative if over-dispersion was present.
 
-# Predicted vs Actual
-ggplot(data.frame(actual=test$total_claims_cost, pred=pred), aes(x=actual, y=pred)) +
-  geom_point(alpha=0.5) +
-  geom_abline(slope=1, intercept=0, color='red') +
-  labs(title="Predicted vs Actual Claims Amounts", x="Actual", y="Predicted")
+The main strong predictors are average vehicle age, vehicle class, and sum insured.
 
-# Residuals vs Fitted
-resid_df <- data.frame(fitted=pred, residuals=test$total_claims_cost - pred)
-ggplot(resid_df, aes(x=fitted, y=residuals)) +
-  geom_point(alpha=0.5) +
-  geom_hline(yintercept=0, colour='red') +
-  labs(title="Residuals vs Fitted (Severity)", x="Fitted Values", y="Residuals") +
-  theme_minimal()
+-   Positive coefficient for sum insured indicates that larger sum insured corresponds to larger claim counts but the smaller positive value for the estimate indicate the effect size is minimal.
 
-# QQ plot
-qqnorm(residuals(glm_train, type="pearson"))
-qqline(residuals(glm_train, type="pearson"), col="red")
-```
+-   Average vehicle age makes sense as well and aligns with the exploratory data analysis conducted earlier where a large majority of claims came from newer cars. The negative coefficient agrees with the analysis conducted prior. This can most likely be attributed to older cars being tend to be driven less or more cautiously, or perhaps a correlation between older cars and safer drivers.
 
-#### Cross Validation
+-   Some particular vehicle classes have significant negative coefficients, indicating lower claim frequencies compared the baseline class. Perhaps there is a correlation between the durability of those vehicle classes or the types of drivers. However it is critical to note the imbalance of vehicle classes in the exploratory data analysis. The vehicle classes with critical p-values also correspond to some of the more numerous vehicle classes in the dataset in general. If a larger proportion of vehicles belong to those particular classes, the model or data even may be correspondingly skewed to favour those claims. Thus, the relationship between vehicle class and claim frequency can be a good correlation, but may not directly reflect whether or not those classes contribute to increased claim frequencies.
+
+\
+Economic indicators (unemployment, gold, CPI categories, wage index) all have non-significant coefficients, suggesting they do not materially influence claim frequency at this aggregated level. Risk state variables (except QLD showing borderline effect) also show weak or no impact. This makes sense as those factors are unlikely to affect the number of vehicles on the road and therefore the corresponding number of accidents.
+
+### Severity Model
+
+Claim severity is modelled using a GLM with a log link and a Gamma distribution.\
+The Gamma family is appropriate because claim amounts are continuous, positive, and right-skewed.
+
+Predictors in the severity model often overlap with the frequency model, but the effects are not necessarily the same. For example, drivers with older cars might not claim more often, but their claims might cost more when they do.
 
 ```{r}
-control <- trainControl(method="cv", number=10)
+sev_formula <- total_cost ~ avg_vehicle_age + vehicle_class + risk_state_name +
+               avg_sum_insured + petrol + unemployment + gold +
+               transport_cpi + motor_cpi + parts_cpi + repair_cpi + wage_index
 
-cv_model <- train(
-  formula(glm_step),
-  data = nonzero_claims,
-  method = "glm",
-  family = Gamma(link="log"),
-  trControl = control
+sev_results <- run_agg_glm_pipeline(
+  data = claims_agg %>% filter(total_cost > 0),
+  formula = sev_formula,
+  family = Gamma(link = "log"),
+  offset_col = "total_claims",
+  plot_title = "Severity: Predicted vs Actual"
 )
 
-cv_model
-
-# CV performance metrics
-cv_pred <- predict(cv_model, nonzero_claims)
-cv_rmse <- sqrt(mean((nonzero_claims$total_claims_cost - cv_pred)^2))
-cv_mae  <- mean(abs(nonzero_claims$total_claims_cost - cv_pred))
-
-cv_rmse
-cv_mae
-cv_model
-```
-
-### Claim Frequency
-
-```{r}
-# Poisson GLM
-freq_glm_full <- glm(
-  claim_count ~ month_sin + month_cos + petrol + unemployment + gold + transport_cpi + motor_cpi + parts_cpi + repair_cpi + wage_index,
-  family = poisson(link="log"),
-  data = claims_by_month
-)
-freq_glm_step <- stepAIC(freq_glm_full, direction="both", trace=FALSE)
-summary(freq_glm_step)
-
-train_idx <- sample(seq_len(nrow(claims_by_month)), size = 0.7 * nrow(claims_by_month))
-train_freq <- claims_by_month[train_idx, ]
-test_freq  <- claims_by_month[-train_idx, ]
-
-freq_glm_train <- glm(
-  formula(freq_glm_step),
-  data = train_freq,
-  family = poisson(link="log")
-)
-
-# Predictions on test set
-pred_freq_poisson <- predict(freq_glm_train, test_freq, type="response")
+sev_model <- sev_results$model
 
 # Metrics
-rmse_poisson <- sqrt(mean((test_freq$claim_count - pred_freq_poisson)^2))
-mae_poisson  <- mean(abs(test_freq$claim_count - pred_freq_poisson))
-dispersion_poisson <- sum(resid(freq_glm_train, type="pearson")^2) / freq_glm_train$df.residual
-
-rmse_poisson
-mae_poisson
-dispersion_poisson
+sev_results$metrics
+summary(sev_model)
 ```
 
-```{r}
-claims_by_month$pred_count <- predict(freq_glm, type = "response")
+The model's average error of \$28000 is large because claim costs themselves are highly skewed and often large. For severity models, absolute error values naturally scale with the underlying claim amounts.\
+On average, predictions miss by \~\$16k. This is typical in aggregated or highly variable claim severity datasets. With a deviance ratio of 0.776 the model explains \~22% of the deviance relative to the null model. This indicates moderate explanatory power which reasonable for severity modelling which tends to be noisy. This is also reflected in the graph where is a general trend can be seen, but there is a very large amount of noise.
 
-# Predicted vs Actual
-ggplot(claims_by_month, aes(x = claim_count, y = pred_count)) +
-  geom_point(alpha = 0.6) +
-  geom_abline(slope = 1, intercept = 0, colour = "red") +
-  labs(title="Predicted vs Actual Claim  (Poisson)", x="Actual", y="Predicted") +
-  theme_minimal()
+Overall, the model captures some structure but a large amount of unexplained variation is expected. Severity is always more volatile than frequency.
 
-ggplot(claims_by_month, aes(x = accident_month, y = claim_count)) +
-  geom_line(color = "steelblue") +
-  geom_line(aes(x = accident_month, y = pred_count), color='red') +
-  labs(title = "Predicted vs Actual claim amount (Poisson)",
-       x = "Accident Month",
-       y = "Number of Claims") +
-  theme_minimal()
+There are only a few significant predictors. These include petrol price, transport cpi, and average sum insured.
 
-# Diagnostic plots
-plot(freq_glm_step)
+-   Petrol price is a moderately positive coefficient, indicating higher petrol prices leads to higher claims. A possible reasoning is that higher petrol costs may reflect broader inflationary pressure, and could therefore proxy economic conditions that increase repair and labour expenses. This would consequentially drive up the claim costs.
 
-# Residuals vs Fitted
-resid_df_poisson <- data.frame(fitted=pred_freq_poisson, residuals=test_freq$claim_count - pred_freq_poisson)
-ggplot(resid_df_poisson, aes(x=fitted, y=residuals)) +
-  geom_point(alpha=0.5) +
-  geom_hline(yintercept=0, color='red') +
-  labs(title="Residuals vs Fitted (Poisson)", x="Fitted Values", y="Residuals") +
-  theme_minimal()
+-   Transport CPI is a negative coefficient. Considering that transport CPI covers things like fuel costs, vehicle maintenance and running costs, but also public transport costs, this seems counter intuitive as repair, replacement part, and labour costs increase. Furthermore, increases in public transport fees would redirect commuters to travel more via private vehicles, increasing road traffic and the chance of motor incidents to occur. As such, it is important to consider other variables at play, such as CPI variables being colinear or aggregation effects causing instability. Furthermore exploration may need to be conducted to examine the true relationship between claim severity and transport CPI.
 
-# QQ plot
-qqnorm(residuals(freq_glm_step, type="pearson"))
-qqline(residuals(freq_glm_step, type="pearson"), col="red")
-         
-```
-
-```{r}
-# Negative Binomial GLM
-freq_nb_full <- MASS::glm.nb(
-  claim_count ~ month_sin + month_cos + petrol + unemployment + gold + transport_cpi + motor_cpi + parts_cpi + repair_cpi + wage_index,
-  data = claims_by_month
-)
-freq_nb_step <- stepAIC(freq_nb_full, direction="both", trace=FALSE)
-
-# Train/Test split (reuse train/test from above)
-freq_nb_train <- MASS::glm.nb(
-  formula(freq_nb_step),
-  data = train_freq
-)
-
-# Predictions
-pred_freq_nb <- predict(freq_nb_train, test_freq, type="response")
-
-# Metrics
-rmse_nb <- sqrt(mean((test_freq$claim_count - pred_freq_nb)^2))
-mae_nb  <- mean(abs(test_freq$claim_count - pred_freq_nb))
-dispersion_nb <- sum(resid(freq_nb_train, type="pearson")^2) / freq_nb_train$df.residual
-
-rmse_nb
-mae_nb
-dispersion_nb
-```
-
-```{r}
-# Predicted vs Actual
-ggplot(claims_by_month, aes(x = claim_count, y = pred_count)) +
-  geom_point(alpha = 0.6) +
-  geom_abline(slope = 1, intercept = 0, colour = "red") +
-  labs(title="Predicted vs Actual Claim Count (Negative Binomial)", x="Actual", y="Predicted") +
-  theme_minimal()
-
-ggplot(claims_by_month, aes(x = accident_month, y = claim_count)) +
-  geom_line(color = "steelblue") +
-  geom_line(aes(x = accident_month, y = pred_count), color='red') +
-  labs(title = "Predicted vs Actual claim amount (Negative Binomial)",
-       x = "Accident Month",
-       y = "Number of Claims") +
-  theme_minimal()
-
-# Diagnostic plots
-plot(freq_nb_step)
-
-# Residuals vs Fitted
-resid_df_nb <- data.frame(fitted=pred_freq_nb, residuals=test_freq$claim_count - pred_freq_nb)
-ggplot(resid_df_nb, aes(x=fitted, y=residuals)) +
-  geom_point(alpha=0.5) +
-  geom_hline(yintercept=0, color='red') +
-  labs(title="Residuals vs Fitted (Negative Binomial)", x="Fitted Values", y="Residuals") +
-  theme_minimal()
-
-# QQ plot
-qqnorm(residuals(freq_nb_step, type="pearson"))
-qqline(residuals(freq_nb_step, type="pearson"), col="red")
-```
-
-#### Cross Validation
-
-```{r}
-control <- trainControl(method="cv", number=10)
-
-freq_cv <- train(
-  claim_count ~ month_sin + month_cos + petrol + unemployment + gold + transport_cpi + motor_cpi + parts_cpi + repair_cpi + wage_index,
-  data = claims_by_month,
-  method = "glm",
-  family = "poisson",
-  trControl = control
-)
-
-freq_cv
-
-# CV metrics
-cv_pred_freq <- predict(freq_cv, claims_by_month)
-freq_rmse <- sqrt(mean((claims_by_month$claim_count - cv_pred_freq)^2))
-freq_mae  <- mean(abs(claims_by_month$claim_count - cv_pred_freq))
-
-freq_rmse
-freq_mae
-```
-
-The monthly claim counts exhibit only small fluctuations (\~5%) around a stable long‑term mean.
-As a result, GLM-based models (Poisson, Negative Binomial) fail to extract meaningful signal from the covariates.
-The models achieve high R² but provide limited predictive value beyond the historical mean.
+Other features tend to have minimal to no effect on claim size. One key variable to note is average sum insured, which you'd believe would be directly correlated to the claim severity. However, considering that it has a borderline p-value (close to 5%), but also a negative coefficient (which indicates the lesser the sum insured, the greater the claim cost). Such a counter intuitive relationship could be a result of aggregated data distorting the results, or perhaps a reflection of individual tendency to have a greater sum insured to more expensive vehicles, and individuals thereby treating the vehicles with more care.
 
 ## Conclusion
 
-The modelling efforts for both claim severity (Gamma GLM) and claim frequency (Poisson and Negative Binomial GLMs) demonstrate that while the models can capture the general level of claims, they fail to accurately predict extreme values.
+The GLM modelling of claim frequency and severity captures the general trends in monthly motor claims but struggles with extreme values and tail behaviour. Key findings include:
 
-Several key observations:
+-   **Frequency:** Average vehicle age, vehicle class, and sum insured are the strongest predictors. Macroeconomic indicators and state-level variables generally have minimal impact.
 
-1.  Low variability relative to scale: Monthly claim counts and total claim costs fluctuate only slightly around a high mean. This results in models that are effectively predicting the average, producing visually flat predictions despite achieving high R² values.
+-   **Severity:** Petrol price, transport CPI, and average sum insured show some influence, though effects are modest and occasionally counter-intuitive due to aggregation effects.
 
-2.  Poor tail performance: Large claims and months with unusually high or low counts are systematically under- or over-predicted. The models are not able to capture rare, extreme events which are critical for accurate risk assessment in insurance.
+-   **Model limitations:** Rare and extreme claims are underrepresented, and short-term macroeconomic factors provide limited explanatory power at the aggregated level.
 
-3.  Covariate limitations: While external macroeconomic factors were included, their explanatory power for short-term fluctuations is limited. Many underlying drivers of claim spikes remain unobserved.
-
-Conclusion:\
-These results highlight that classical GLMs are limited in capturing rare events or tail behaviour in highly stable, low-variance datasets. Future work could explore either transforming the target variable (e.g., modeling month-to-month changes or log-transformed costs) or time-series-specific approaches to better capture the seasonal and extreme-value dynamics of claim data.
+Overall, classical GLMs are appropriate for capturing central trends and providing interpretable insights but are less effective at predicting tail events. Future improvements could involve time-series models, target transformations, or hybrid approaches to better account for extreme claims and seasonality.
