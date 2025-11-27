@@ -2,7 +2,7 @@
 
 **Author:** Henry Zhang
 **Date:** 2023-07-22
-
+[View full report](https://hhappyz88.github.io/GLM-on-motor-insurance-claims/report.html)
 ### Overview
 
 * Analysed **1.2M policy-months** of motor insurance claims to understand post-Covid claim inflation.
